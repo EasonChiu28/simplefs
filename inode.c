@@ -1,4 +1,4 @@
-/* inode.c */
+/* inode.c - Simple mkdir support (step by step approach) */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
@@ -15,9 +15,20 @@ static struct dentry *simplefs_lookup(struct inode *dir,
                                       unsigned int flags);
 static int simplefs_readpage(struct file *file, struct page *page);
 
-static const struct inode_operations simplefs_inode_ops;
-static const struct file_operations simplefs_file_ops;
-static const struct address_space_operations simplefs_aops;
+/* Let's start with just the basic operations - same as original */
+static const struct inode_operations simplefs_inode_ops = {
+    .lookup = simplefs_lookup,
+};
+
+static const struct file_operations simplefs_file_ops = {
+    .owner = THIS_MODULE,
+    .read_iter = generic_file_read_iter,
+    .llseek = generic_file_llseek,
+};
+
+static const struct address_space_operations simplefs_aops = {
+    .readpage = simplefs_readpage,
+};
 
 struct inode *simplefs_iget(struct super_block *sb, unsigned long ino)
 {
@@ -52,12 +63,20 @@ struct inode *simplefs_iget(struct super_block *sb, unsigned long ino)
     i_gid_write(inode, le32_to_cpu(raw_inode->i_gid));
     inode->i_size = le32_to_cpu(raw_inode->i_size);
     set_nlink(inode, le32_to_cpu(raw_inode->i_nlink));
+    ci->ei_block = le32_to_cpu(raw_inode->ei_block);
 
     /* Set timestamps to prevent issues */
     inode->i_atime = inode->i_mtime = inode->i_ctime = current_time(inode);
 
+    /* Initialize additional inode fields that might be expected */
+    inode->i_blocks = 1;
+    inode->i_blkbits = sb->s_blocksize_bits;
+    
+    /* For simplicity, disable atime updates to avoid I/O list complications */
+    inode->i_flags |= S_NOATIME;
+
     pr_info("Inode %lu: mode=0x%x, size=%lld, block=%u\n", 
-             ino, inode->i_mode, inode->i_size, le32_to_cpu(raw_inode->ei_block));
+             ino, inode->i_mode, inode->i_size, ci->ei_block);
 
     if (S_ISDIR(inode->i_mode)) {
         pr_info("Setting up directory inode %lu\n", ino);
@@ -65,17 +84,18 @@ struct inode *simplefs_iget(struct super_block *sb, unsigned long ino)
         inode->i_fop = &simplefs_dir_ops;
         /* Important: set directory size properly */
         inode->i_size = SIMPLEFS_BLOCK_SIZE;
-        ci->ei_block = le32_to_cpu(raw_inode->ei_block);
         pr_info("Directory inode %lu: block=%u, fop=%p\n", ino, ci->ei_block, inode->i_fop);
     } else if (S_ISREG(inode->i_mode)) {
         pr_info("Setting up regular file inode %lu\n", ino);
         inode->i_op = &simplefs_inode_ops;
         inode->i_fop = &simplefs_file_ops;
         inode->i_mapping->a_ops = &simplefs_aops;
-        ci->ei_block = le32_to_cpu(raw_inode->ei_block);
         pr_info("File inode %lu: block=%u, size=%lld\n", ino, ci->ei_block, inode->i_size);
     } else {
         pr_err("Unknown inode type: mode=0x%x for inode %lu\n", inode->i_mode, ino);
+        brelse(bh);
+        iget_failed(inode);
+        return ERR_PTR(-EINVAL);
     }
 
     brelse(bh);
@@ -216,17 +236,3 @@ done:
     unlock_page(page);
     return 0;
 }
-
-static const struct inode_operations simplefs_inode_ops = {
-    .lookup = simplefs_lookup,
-};
-
-static const struct file_operations simplefs_file_ops = {
-    .owner = THIS_MODULE,
-    .read_iter = generic_file_read_iter,
-    .llseek = generic_file_llseek,
-};
-
-static const struct address_space_operations simplefs_aops = {
-    .readpage = simplefs_readpage,
-};
