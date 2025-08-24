@@ -9,83 +9,80 @@
 
 #include "simplefs.h"
 
+/*
+ * Iterate over the files contained in dir and commit them in ctx.
+ * This function is called by the VFS while ctx->pos changes.
+ * Return 0 on success.
+ */
 static int simplefs_iterate(struct file *dir, struct dir_context *ctx)
 {
     struct inode *inode = file_inode(dir);
-    struct super_block *sb = inode->i_sb;
     struct simplefs_inode_info *ci = SIMPLEFS_INODE(inode);
-    struct buffer_head *bh;
-    struct simplefs_dir_block *dblock;
-    uint32_t nr_files;
-    int i, start_index;
+    struct super_block *sb = inode->i_sb;
+    struct buffer_head *bh = NULL;
+    struct simplefs_dir_block *dblock = NULL;
+    struct simplefs_file *f = NULL;
+    int i;
 
-    /* Handle . and .. entries first */
-    if (!dir_emit_dots(dir, ctx)) {
+    pr_info("Directory iteration: pos=%lld, inode=%lu, block=%u\n", 
+            ctx->pos, inode->i_ino, ci->ei_block);
+
+    /* Check that dir is a directory */
+    if (!S_ISDIR(inode->i_mode))
+        return -ENOTDIR;
+
+    /*
+     * Check that ctx->pos is not bigger than what we can handle (including
+     * . and ..)
+     */
+    if (ctx->pos > SIMPLEFS_MAX_SUBFILES + 2)
         return 0;
-    }
 
-    /* Check if we're past all possible entries */
-    if (ctx->pos >= SIMPLEFS_MAX_SUBFILES + 2) {
+    /* Commit . and .. to ctx - this handles both entries at once */
+    if (!dir_emit_dots(dir, ctx))
         return 0;
-    }
 
-    /* Read directory block */
+    /* Read the directory index block on disk */
     bh = sb_bread(sb, ci->ei_block);
     if (!bh) {
+        pr_err("Failed to read directory block %u\n", ci->ei_block);
         return -EIO;
     }
+    dblock = (struct simplefs_dir_block *) bh->b_data;
 
-    dblock = (struct simplefs_dir_block *)bh->b_data;
-    nr_files = le32_to_cpu(dblock->nr_files);
-    
-    /* Bounds checking */
-    if (nr_files > SIMPLEFS_MAX_SUBFILES) {
-        brelse(bh);
-        return -EIO;
-    }
+    pr_info("Directory loaded, nr_files=%u, starting from file index %d\n", 
+            le32_to_cpu(dblock->nr_files), (int)(ctx->pos - 2));
 
-    /* Calculate starting index */
-    start_index = ctx->pos - 2;
-    
-    /* Iterate through files */
-    for (i = start_index; i < nr_files; i++) {
-        struct simplefs_file *f = &dblock->files[i];
-        uint32_t ino;
+    /* Iterate over the index block and commit subfiles */
+    for (i = ctx->pos - 2; i < SIMPLEFS_MAX_SUBFILES; i++) {
+        f = &dblock->files[i];
         
-        if (i < 0) continue;
-        
-        ino = le32_to_cpu(f->inode);
-        
-        /* Validate inode number */
-        if (ino == 0 || ino > SIMPLEFS_MAX_SUBFILES) {
-            ctx->pos++;
-            continue;
+        /* If inode is 0, we've reached the end of files */
+        if (!f->inode) {
+            pr_info("End of directory entries at index %d\n", i);
+            break;
         }
         
-        /* Ensure null termination */
-        f->filename[SIMPLEFS_FILENAME_LEN - 1] = '\0';
+        pr_info("Emitting file[%d]: '%s' -> inode %u\n", i, f->filename, le32_to_cpu(f->inode));
         
-        /* Skip empty names */
-        if (f->filename[0] == '\0') {
-            ctx->pos++;
-            continue;
+        /* Emit the directory entry */
+        if (!dir_emit(ctx, f->filename, strnlen(f->filename, SIMPLEFS_FILENAME_LEN), 
+                      le32_to_cpu(f->inode), DT_UNKNOWN)) {
+            pr_info("dir_emit failed for '%s'\n", f->filename);
+            break;
         }
         
-        /* Emit the entry */
-        if (!dir_emit(ctx, f->filename, strlen(f->filename), ino, DT_REG)) {
-            brelse(bh);
-            return 0;
-        }
-        
+        pr_info("Successfully emitted '%s'\n", f->filename);
         ctx->pos++;
     }
 
     brelse(bh);
+    pr_info("Directory iteration complete, final pos=%lld\n", ctx->pos);
+
     return 0;
 }
 
 const struct file_operations simplefs_dir_ops = {
     .owner = THIS_MODULE,
     .iterate_shared = simplefs_iterate,
-    .llseek = generic_file_llseek,
 };

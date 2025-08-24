@@ -1,4 +1,4 @@
-/* mkfs.simplefs.c */
+/* mkfs.simplefs.c - Updated to match reference structure */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <stdint.h>
+#include <endian.h>
 
 #define __le32 uint32_t
 #include "simplefs.h"
@@ -77,14 +78,14 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    /* Create root directory inode (inode 1) */
+    /* Create root directory inode (inode 1) - using simplified structure */
     struct simplefs_inode root_inode = {0};
     root_inode.i_mode = S_IFDIR | 0755;
     root_inode.i_uid = 0;
     root_inode.i_gid = 0;
     root_inode.i_size = SIMPLEFS_BLOCK_SIZE;
     root_inode.i_nlink = 2;
-    root_inode.ei_block = 4;  /* Root directory data is now in Block 4 */
+    root_inode.ei_block = 4;  /* Root directory data is in Block 4 */
 
     /* Write root inode to Block 1 */
     lseek(fd, SIMPLEFS_BLOCK_SIZE, SEEK_SET);
@@ -103,7 +104,7 @@ int main(int argc, char *argv[])
     hello_inode.i_gid = 0;
     hello_inode.i_size = content_size;
     hello_inode.i_nlink = 1;
-    hello_inode.ei_block = 5;  /* hello.txt data is now in Block 5 */
+    hello_inode.ei_block = 5;  /* hello.txt data is in Block 5 */
 
     /* Write hello.txt inode immediately after root inode */
     ret = write(fd, &hello_inode, sizeof(hello_inode));
@@ -156,11 +157,16 @@ int main(int argc, char *argv[])
 
     free(bitmap_buffer);
 
-    /* Create root directory data block */
+    /* Create root directory data block - using simplified structure */
     struct simplefs_dir_block root_dir_block = {0};
-    root_dir_block.nr_files = 1;
-    strcpy(root_dir_block.files[0].filename, "hello.txt");
-    root_dir_block.files[0].inode = 2;
+    /* Set number of files */
+    
+    root_dir_block.nr_files = htole32(1);
+    /* Initialize the first file entry */
+    root_dir_block.files[0].inode = htole32(2);
+    strncpy(root_dir_block.files[0].filename, "hello.txt", SIMPLEFS_FILENAME_LEN);
+    
+    /* All other entries are already zeroed (inode = 0 means empty) */
 
     /* Write root directory data to Block 4 */
     lseek(fd, SIMPLEFS_BLOCK_SIZE * 4, SEEK_SET);

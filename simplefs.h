@@ -3,11 +3,11 @@
 
 #include <linux/types.h>
 
-/* Constants */
+/* Constants - aligned with reference implementation */
 #define SIMPLEFS_MAGIC              0xDEADBEEF
 #define SIMPLEFS_BLOCK_SIZE         4096
-#define SIMPLEFS_FILENAME_LEN       255
-#define SIMPLEFS_MAX_SUBFILES       1024
+#define SIMPLEFS_FILENAME_LEN       28    /* Changed from 255 to 28 like reference */
+#define SIMPLEFS_MAX_SUBFILES       128   /* Changed from 1024 to 128 like reference */
 #define SIMPLEFS_INODES_PER_BLOCK   (SIMPLEFS_BLOCK_SIZE / sizeof(struct simplefs_inode))
 
 /* Fixed block layout */
@@ -22,7 +22,7 @@
 #define SIMPLEFS_MAX_INODES         SIMPLEFS_BITS_PER_BLOCK
 #define SIMPLEFS_MAX_BLOCKS         SIMPLEFS_BITS_PER_BLOCK
 
-/* On-disk data structures */
+/* On-disk data structures - simplified and aligned with reference */
 struct simplefs_sb_info {
     __le32 magic;
     __le32 nr_blocks;
@@ -40,16 +40,17 @@ struct simplefs_inode {
     __le32 i_gid;
     __le32 i_size;
     __le32 i_nlink;
-    __le32 ei_block;
+    __le32 ei_block;   /* For both files and directories, use ei_block */
 };
 
+/* Directory file entry - aligned with reference (28 char filename) */
 struct simplefs_file {
-    char filename[SIMPLEFS_FILENAME_LEN];
     __le32 inode;
+    char filename[SIMPLEFS_FILENAME_LEN];
 };
 
 struct simplefs_dir_block {
-    __le32 nr_files;
+    __le32 nr_files;  /* Keep this for compatibility with existing code */
     struct simplefs_file files[SIMPLEFS_MAX_SUBFILES];
 };
 
@@ -59,7 +60,7 @@ struct simplefs_dir_block {
 
 /* In-memory data structures */
 struct simplefs_inode_info {
-    __u32 ei_block;
+    __u32 ei_block;   /* Use ei_block for both files and directories */
     struct inode vfs_inode;
 };
 

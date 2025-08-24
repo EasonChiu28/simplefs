@@ -56,6 +56,35 @@ static int simplefs_write_inode(struct inode *inode, struct writeback_control *w
     return 0;
 }
 
+/* Sync superblock changes to disk */
+static int simplefs_sync_sb(struct super_block *sb)
+{
+    struct simplefs_sb_info *sbi = SIMPLEFS_SB(sb);
+    struct buffer_head *bh;
+    struct simplefs_sb_info *disk_sb;
+
+    bh = sb_bread(sb, SIMPLEFS_SUPERBLOCK_BLOCK);
+    if (!bh) {
+        pr_err("Failed to read superblock for sync\n");
+        return -EIO;
+    }
+
+    disk_sb = (struct simplefs_sb_info *)bh->b_data;
+    
+    /* Update on-disk superblock with current values */
+    disk_sb->nr_free_blocks = cpu_to_le32(sbi->nr_free_blocks);
+    disk_sb->nr_free_inodes = cpu_to_le32(sbi->nr_free_inodes);
+    
+    mark_buffer_dirty(bh);
+    sync_dirty_buffer(bh);
+    brelse(bh);
+    
+    pr_info("Synced superblock: free_blocks=%u, free_inodes=%u\n",
+            sbi->nr_free_blocks, sbi->nr_free_inodes);
+    
+    return 0;
+}
+
 static int simplefs_statfs(struct dentry *dentry, struct kstatfs *stat)
 {
     struct super_block *sb = dentry->d_sb;
@@ -73,12 +102,18 @@ static int simplefs_statfs(struct dentry *dentry, struct kstatfs *stat)
     return 0;
 }
 
+static int simplefs_sync_fs(struct super_block *sb, int wait)
+{
+    return simplefs_sync_sb(sb);
+}
+
 static const struct super_operations simplefs_super_ops = {
     .alloc_inode = simplefs_alloc_inode,
     .destroy_inode = simplefs_destroy_inode,
     .put_super = simplefs_put_super,
     .write_inode = simplefs_write_inode,
     .statfs = simplefs_statfs,
+    .sync_fs = simplefs_sync_fs,
 };
 
 int simplefs_fill_super(struct super_block *sb, void *data, int silent)

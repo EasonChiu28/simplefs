@@ -25,15 +25,30 @@ static int test_bit_in_buffer(unsigned char *buffer, int bit)
     return (buffer[bit / 8] & (1 << (bit % 8))) != 0;
 }
 
-static int find_first_zero_bit_in_buffer(unsigned char *buffer, int max_bits)
+/* Update superblock on disk */
+static int simplefs_update_sb(struct super_block *sb)
 {
-    int i;
-    for (i = 0; i < max_bits; i++) {
-        if (!test_bit_in_buffer(buffer, i)) {
-            return i;
-        }
+    struct simplefs_sb_info *sbi = SIMPLEFS_SB(sb);
+    struct buffer_head *bh;
+    struct simplefs_sb_info *disk_sb;
+
+    bh = sb_bread(sb, SIMPLEFS_SUPERBLOCK_BLOCK);
+    if (!bh) {
+        pr_err("Failed to read superblock for update\n");
+        return -EIO;
     }
-    return -1;  /* No free bit found */
+
+    disk_sb = (struct simplefs_sb_info *)bh->b_data;
+    
+    /* Update free counts on disk */
+    disk_sb->nr_free_blocks = cpu_to_le32(sbi->nr_free_blocks);
+    disk_sb->nr_free_inodes = cpu_to_le32(sbi->nr_free_inodes);
+    
+    mark_buffer_dirty(bh);
+    sync_dirty_buffer(bh);
+    brelse(bh);
+    
+    return 0;
 }
 
 /* Allocate a free inode number */
@@ -43,6 +58,10 @@ int simplefs_alloc_inode_num(struct super_block *sb)
     struct buffer_head *bh;
     unsigned char *bitmap;
     int free_inode;
+    int i;
+
+    pr_info("Allocating inode: free_inodes=%u, total_inodes=%u\n", 
+            sbi->nr_free_inodes, sbi->nr_inodes);
 
     if (sbi->nr_free_inodes == 0) {
         pr_err("No free inodes available\n");
@@ -58,11 +77,26 @@ int simplefs_alloc_inode_num(struct super_block *sb)
 
     bitmap = (unsigned char *)bh->b_data;
     
-    /* Find first free inode (skip inode 0 which is reserved) */
-    free_inode = find_first_zero_bit_in_buffer(bitmap, sbi->nr_inodes);
-    if (free_inode <= 0 || free_inode >= sbi->nr_inodes) {
+    /* Find first free inode starting from inode 1 (skip inode 0 which is reserved) */
+    free_inode = -1;
+    for (i = 1; i < sbi->nr_inodes; i++) {
+        if (!test_bit_in_buffer(bitmap, i)) {
+            free_inode = i;
+            break;
+        }
+    }
+    
+    if (free_inode < 0) {
         brelse(bh);
-        pr_err("No free inode found in bitmap\n");
+        pr_err("No free inode found in bitmap (searched %u inodes)\n", sbi->nr_inodes);
+        /* Debug: show first few bytes of bitmap */
+        bh = sb_bread(sb, sbi->inode_bitmap_block);
+        if (bh) {
+            pr_err("Bitmap first 8 bytes: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                   bh->b_data[0], bh->b_data[1], bh->b_data[2], bh->b_data[3],
+                   bh->b_data[4], bh->b_data[5], bh->b_data[6], bh->b_data[7]);
+            brelse(bh);
+        }
         return -ENOSPC;
     }
 
@@ -71,12 +105,14 @@ int simplefs_alloc_inode_num(struct super_block *sb)
     
     /* Mark buffer as dirty and release */
     mark_buffer_dirty(bh);
+    sync_dirty_buffer(bh);
     brelse(bh);
 
     /* Update superblock free count */
     sbi->nr_free_inodes--;
+    simplefs_update_sb(sb);
 
-    pr_info("Allocated inode %d\n", free_inode);
+    pr_info("Allocated inode %d (remaining: %u)\n", free_inode, sbi->nr_free_inodes);
     return free_inode;
 }
 
@@ -113,10 +149,12 @@ void simplefs_free_inode_num(struct super_block *sb, unsigned long ino)
     
     /* Mark buffer as dirty and release */
     mark_buffer_dirty(bh);
+    sync_dirty_buffer(bh);
     brelse(bh);
 
     /* Update superblock free count */
     sbi->nr_free_inodes++;
+    simplefs_update_sb(sb);
 
     pr_info("Freed inode %lu\n", ino);
 }
@@ -128,6 +166,10 @@ int simplefs_alloc_block_num(struct super_block *sb)
     struct buffer_head *bh;
     unsigned char *bitmap;
     int free_block;
+    int i;
+
+    pr_info("Allocating block: free_blocks=%u, first_data=%u\n", 
+            sbi->nr_free_blocks, sbi->first_data_block);
 
     if (sbi->nr_free_blocks == 0) {
         pr_err("No free blocks available\n");
@@ -144,28 +186,18 @@ int simplefs_alloc_block_num(struct super_block *sb)
     bitmap = (unsigned char *)bh->b_data;
     
     /* Find first free block starting from first data block */
-    free_block = find_first_zero_bit_in_buffer(bitmap, sbi->nr_blocks);
-    if (free_block < 0 || free_block >= sbi->nr_blocks) {
-        brelse(bh);
-        pr_err("No free block found in bitmap\n");
-        return -ENOSPC;
+    free_block = -1;
+    for (i = sbi->first_data_block; i < sbi->nr_blocks; i++) {
+        if (!test_bit_in_buffer(bitmap, i)) {
+            free_block = i;
+            break;
+        }
     }
-
-    /* Make sure we don't allocate reserved blocks */
-    if (free_block < sbi->first_data_block) {
-        /* Find first free block after reserved area */
-        int i;
-        for (i = sbi->first_data_block; i < sbi->nr_blocks; i++) {
-            if (!test_bit_in_buffer(bitmap, i)) {
-                free_block = i;
-                break;
-            }
-        }
-        if (i >= sbi->nr_blocks) {
-            brelse(bh);
-            pr_err("No free data block found\n");
-            return -ENOSPC;
-        }
+    
+    if (free_block < 0) {
+        brelse(bh);
+        pr_err("No free data block found\n");
+        return -ENOSPC;
     }
 
     /* Mark block as used */
@@ -173,12 +205,14 @@ int simplefs_alloc_block_num(struct super_block *sb)
     
     /* Mark buffer as dirty and release */
     mark_buffer_dirty(bh);
+    sync_dirty_buffer(bh);
     brelse(bh);
 
     /* Update superblock free count */
     sbi->nr_free_blocks--;
+    simplefs_update_sb(sb);
 
-    pr_info("Allocated block %d\n", free_block);
+    pr_info("Allocated block %d (remaining: %u)\n", free_block, sbi->nr_free_blocks);
     return free_block;
 }
 
@@ -215,10 +249,12 @@ void simplefs_free_block_num(struct super_block *sb, unsigned long block)
     
     /* Mark buffer as dirty and release */
     mark_buffer_dirty(bh);
+    sync_dirty_buffer(bh);
     brelse(bh);
 
     /* Update superblock free count */
     sbi->nr_free_blocks++;
+    simplefs_update_sb(sb);
 
     pr_info("Freed block %lu\n", block);
 }
