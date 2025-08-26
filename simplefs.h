@@ -81,12 +81,16 @@ void simplefs_free_inode_num(struct super_block *sb, unsigned long ino);
 int simplefs_alloc_block_num(struct super_block *sb);
 void simplefs_free_block_num(struct super_block *sb, unsigned long block);
 
-/* Function Prototypes */
+/* Super block operations */
 int simplefs_fill_super(struct super_block *sb, void *data, int silent);
+int simplefs_sync_sb(struct super_block *sb);
+
+/* Inode operations */
 int simplefs_init_inode_cache(void);
 void simplefs_destroy_inode_cache(void);
 struct inode *simplefs_iget(struct super_block *sb, unsigned long ino);
 
+/* File operations */
 extern const struct file_operations simplefs_dir_ops;
 
 #endif /* __KERNEL__ */

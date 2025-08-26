@@ -1,4 +1,4 @@
-/* super.c */
+/* super.c - Enhanced with forced disk persistence */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
@@ -8,10 +8,34 @@
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/statfs.h>
+#include <linux/blkdev.h>
 
 #include "simplefs.h"
 
 static struct kmem_cache *simplefs_inode_cache;
+
+/* Force write buffer to disk immediately */
+static int force_write_buffer(struct buffer_head *bh)
+{
+    int ret;
+    
+    mark_buffer_dirty(bh);
+    ret = sync_dirty_buffer(bh);
+    if (ret) {
+        pr_err("Failed to sync buffer to disk: %d\n", ret);
+        return ret;
+    }
+    
+    /* Additional barrier to ensure write completion */
+    if (bh->b_bdev && bh->b_bdev->bd_disk) {
+        ret = blkdev_issue_flush(bh->b_bdev, GFP_KERNEL, NULL);
+        if (ret) {
+            pr_warn("Failed to flush device: %d\n", ret);
+        }
+    }
+    
+    return 0;
+}
 
 int simplefs_init_inode_cache(void)
 {
@@ -47,21 +71,30 @@ static void simplefs_put_super(struct super_block *sb)
 {
     struct simplefs_sb_info *sbi = SIMPLEFS_SB(sb);
     if (sbi) {
+        /* Final sync before unmount */
+        pr_info("Final superblock sync before unmount\n");
+        simplefs_sync_sb(sb);
         kfree(sbi);
     }
 }
 
 static int simplefs_write_inode(struct inode *inode, struct writeback_control *wbc)
 {
+    /* For now, we don't implement individual inode writing */
+    /* All inode updates are done immediately in operations */
     return 0;
 }
 
-/* Sync superblock changes to disk */
-static int simplefs_sync_sb(struct super_block *sb)
+/* Sync superblock changes to disk with forced write */
+int simplefs_sync_sb(struct super_block *sb)
 {
     struct simplefs_sb_info *sbi = SIMPLEFS_SB(sb);
     struct buffer_head *bh;
     struct simplefs_sb_info *disk_sb;
+    int ret;
+
+    pr_info("Syncing superblock to disk: free_blocks=%u, free_inodes=%u\n",
+            sbi->nr_free_blocks, sbi->nr_free_inodes);
 
     bh = sb_bread(sb, SIMPLEFS_SUPERBLOCK_BLOCK);
     if (!bh) {
@@ -75,20 +108,39 @@ static int simplefs_sync_sb(struct super_block *sb)
     disk_sb->nr_free_blocks = cpu_to_le32(sbi->nr_free_blocks);
     disk_sb->nr_free_inodes = cpu_to_le32(sbi->nr_free_inodes);
     
-    mark_buffer_dirty(bh);
-    sync_dirty_buffer(bh);
+    /* Force immediate write to disk */
+    ret = force_write_buffer(bh);
     brelse(bh);
     
-    pr_info("Synced superblock: free_blocks=%u, free_inodes=%u\n",
-            sbi->nr_free_blocks, sbi->nr_free_inodes);
+    if (ret == 0) {
+        pr_info("Superblock synced to disk successfully: free_blocks=%u, free_inodes=%u\n",
+                sbi->nr_free_blocks, sbi->nr_free_inodes);
+    } else {
+        pr_err("Failed to sync superblock to disk: %d\n", ret);
+    }
     
-    return 0;
+    return ret;
 }
 
 static int simplefs_statfs(struct dentry *dentry, struct kstatfs *stat)
 {
     struct super_block *sb = dentry->d_sb;
     struct simplefs_sb_info *sbi = SIMPLEFS_SB(sb);
+
+    /* Re-read superblock from disk to get current state */
+    struct buffer_head *bh = sb_bread(sb, SIMPLEFS_SUPERBLOCK_BLOCK);
+    if (bh) {
+        struct simplefs_sb_info *disk_sb = (struct simplefs_sb_info *)bh->b_data;
+        
+        /* Update in-memory values from disk (in case of inconsistency) */
+        sbi->nr_free_blocks = le32_to_cpu(disk_sb->nr_free_blocks);
+        sbi->nr_free_inodes = le32_to_cpu(disk_sb->nr_free_inodes);
+        
+        brelse(bh);
+        
+        pr_info("statfs: Updated from disk - free_blocks=%u, free_inodes=%u\n",
+                sbi->nr_free_blocks, sbi->nr_free_inodes);
+    }
 
     stat->f_type = SIMPLEFS_MAGIC;
     stat->f_bsize = SIMPLEFS_BLOCK_SIZE;
@@ -104,6 +156,7 @@ static int simplefs_statfs(struct dentry *dentry, struct kstatfs *stat)
 
 static int simplefs_sync_fs(struct super_block *sb, int wait)
 {
+    pr_info("sync_fs called (wait=%d)\n", wait);
     return simplefs_sync_sb(sb);
 }
 
@@ -154,6 +207,7 @@ int simplefs_fill_super(struct super_block *sb, void *data, int silent)
     }
 
     /* Copy superblock data to in-memory structure */
+    sbi->magic = le32_to_cpu(csb->magic);
     sbi->nr_blocks = le32_to_cpu(csb->nr_blocks);
     sbi->nr_inodes = le32_to_cpu(csb->nr_inodes);
     sbi->nr_free_blocks = le32_to_cpu(csb->nr_free_blocks);
@@ -165,12 +219,36 @@ int simplefs_fill_super(struct super_block *sb, void *data, int silent)
     sb->s_fs_info = sbi;
     brelse(bh);
 
-    pr_info("Mounted filesystem: %u blocks, %u inodes\n", 
+    pr_info("Mounted filesystem from disk: %u blocks, %u inodes\n", 
             sbi->nr_blocks, sbi->nr_inodes);
-    pr_info("Free: %u blocks, %u inodes\n", 
+    pr_info("Current disk state - Free: %u blocks, %u inodes\n", 
             sbi->nr_free_blocks, sbi->nr_free_inodes);
     pr_info("Bitmaps: inode=%u, block=%u, first_data=%u\n",
             sbi->inode_bitmap_block, sbi->block_bitmap_block, sbi->first_data_block);
+
+    /* Validate superblock values */
+    if (sbi->nr_blocks == 0 || sbi->nr_inodes == 0) {
+        pr_err("Invalid superblock: nr_blocks=%u, nr_inodes=%u\n",
+               sbi->nr_blocks, sbi->nr_inodes);
+        ret = -EINVAL;
+        goto free_sbi;
+    }
+
+    if (sbi->first_data_block >= sbi->nr_blocks) {
+        pr_err("Invalid first_data_block=%u (nr_blocks=%u)\n",
+               sbi->first_data_block, sbi->nr_blocks);
+        ret = -EINVAL;
+        goto free_sbi;
+    }
+
+    /* Additional consistency check: verify bitmap blocks exist */
+    if (sbi->inode_bitmap_block >= sbi->nr_blocks || 
+        sbi->block_bitmap_block >= sbi->nr_blocks) {
+        pr_err("Invalid bitmap blocks: inode_bitmap=%u, block_bitmap=%u (nr_blocks=%u)\n",
+               sbi->inode_bitmap_block, sbi->block_bitmap_block, sbi->nr_blocks);
+        ret = -EINVAL;
+        goto free_sbi;
+    }
 
     /* Get root inode (inode 1) */
     pr_info("Loading root inode (inode 1)\n");
@@ -181,7 +259,7 @@ int simplefs_fill_super(struct super_block *sb, void *data, int silent)
         goto free_sbi;
     }
     
-    pr_info("Root inode loaded successfully\n");
+    pr_info("Root inode loaded successfully from disk\n");
     pr_info("Root inode: mode=0x%x, size=%lld, i_fop=%p\n", 
             root_inode->i_mode, root_inode->i_size, root_inode->i_fop);
 
@@ -194,7 +272,7 @@ int simplefs_fill_super(struct super_block *sb, void *data, int silent)
         goto iput;
     }
 
-    pr_info("Superblock setup complete\n");
+    pr_info("Superblock setup complete - filesystem ready with disk persistence\n");
     return 0;
 
 iput:

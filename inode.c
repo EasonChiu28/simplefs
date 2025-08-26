@@ -1,4 +1,4 @@
-/* inode.c - Simple filesystem with mkdir support */
+/* inode.c - Enhanced with forced disk persistence for mkdir */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
@@ -7,6 +7,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/pagemap.h>
+#include <linux/blkdev.h>
 
 #include "simplefs.h"
 
@@ -15,6 +16,29 @@ static struct dentry *simplefs_lookup(struct inode *dir,
                                       unsigned int flags);
 static int simplefs_readpage(struct file *file, struct page *page);
 static int simplefs_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode);
+
+/* Force write buffer to disk immediately */
+static int force_write_buffer(struct buffer_head *bh)
+{
+    int ret;
+    
+    mark_buffer_dirty(bh);
+    ret = sync_dirty_buffer(bh);
+    if (ret) {
+        pr_err("Failed to sync buffer to disk: %d\n", ret);
+        return ret;
+    }
+    
+    /* Additional barrier to ensure write completion */
+    if (bh->b_bdev && bh->b_bdev->bd_disk) {
+        ret = blkdev_issue_flush(bh->b_bdev, GFP_KERNEL, NULL);
+        if (ret) {
+            pr_warn("Failed to flush device: %d\n", ret);
+        }
+    }
+    
+    return 0;
+}
 
 /* inode operations with mkdir support */
 static const struct inode_operations simplefs_inode_ops = {
@@ -271,7 +295,8 @@ static int simplefs_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode
         return new_block;
     }
 
-    pr_info("mkdir: Allocated inode %d, block %d\n", new_ino, new_block);
+    pr_info("mkdir: Allocated inode %d, block %d (both written to disk)\n", 
+            new_ino, new_block);
 
     /* Read parent directory */
     bh = sb_bread(sb, ci_dir->ei_block);
@@ -310,11 +335,17 @@ static int simplefs_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode
     new_entry->inode = cpu_to_le32(new_ino);
     dblock->nr_files = cpu_to_le32(nr_files + 1);
 
-    /* Write parent directory */
-    mark_buffer_dirty(bh);
-    sync_dirty_buffer(bh);
+    /* Force write parent directory to disk */
+    ret = force_write_buffer(bh);
     brelse(bh);
     bh = NULL;
+    
+    if (ret) {
+        pr_err("Failed to write parent directory to disk: %d\n", ret);
+        goto cleanup;
+    }
+    
+    pr_info("mkdir: Parent directory updated and written to disk\n");
 
     /* Create the directory inode on disk */
     {
@@ -323,7 +354,8 @@ static int simplefs_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode
         uint32_t inode_block = (new_ino / SIMPLEFS_INODES_PER_BLOCK) + 1;
         uint32_t inode_shift = new_ino % SIMPLEFS_INODES_PER_BLOCK;
 
-        pr_info("mkdir: Writing directory inode %d to block %u, shift %u\n", new_ino, inode_block, inode_shift);
+        pr_info("mkdir: Writing directory inode %d to block %u, shift %u\n", 
+                new_ino, inode_block, inode_shift);
 
         inode_bh = sb_bread(sb, inode_block);
         if (!inode_bh) {
@@ -343,11 +375,16 @@ static int simplefs_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode
         raw_inode->i_nlink = cpu_to_le32(2); /* . and .. */
         raw_inode->ei_block = cpu_to_le32(new_block);
 
-        mark_buffer_dirty(inode_bh);
-        sync_dirty_buffer(inode_bh);
+        /* Force write inode to disk */
+        ret = force_write_buffer(inode_bh);
         brelse(inode_bh);
+        
+        if (ret) {
+            pr_err("Failed to write directory inode to disk: %d\n", ret);
+            goto cleanup;
+        }
 
-        pr_info("mkdir: Directory inode written successfully\n");
+        pr_info("mkdir: Directory inode written to disk successfully\n");
     }
 
     /* Initialize the directory data block */
@@ -368,14 +405,19 @@ static int simplefs_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode
         memset(dir_data, 0, sizeof(*dir_data));
         dir_data->nr_files = cpu_to_le32(0); /* Empty directory */
 
-        mark_buffer_dirty(data_bh);
-        sync_dirty_buffer(data_bh);
+        /* Force write directory data to disk */
+        ret = force_write_buffer(data_bh);
         brelse(data_bh);
+        
+        if (ret) {
+            pr_err("Failed to write directory data to disk: %d\n", ret);
+            goto cleanup;
+        }
 
-        pr_info("mkdir: Directory data block initialized\n");
+        pr_info("mkdir: Directory data block initialized and written to disk\n");
     }
 
-    pr_info("mkdir: Successfully created directory '%s' with inode %d, block %d\n", 
+    pr_info("mkdir: Successfully created directory '%s' with inode %d, block %d - all data written to disk\n", 
             dentry->d_name.name, new_ino, new_block);
     return 0;
 
@@ -385,6 +427,8 @@ cleanup:
     }
     simplefs_free_block_num(sb, new_block);
     simplefs_free_inode_num(sb, new_ino);
+    pr_err("mkdir: Failed to create directory '%s', cleaned up resources\n", 
+           dentry->d_name.name);
     return ret;
 }
 

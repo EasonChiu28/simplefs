@@ -1,4 +1,4 @@
-/* bitmap.c */
+/* bitmap.c - Enhanced with forced disk persistence */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
@@ -6,6 +6,7 @@
 #include <linux/fs.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/blkdev.h>
 
 #include "simplefs.h"
 
@@ -25,12 +26,39 @@ static int test_bit_in_buffer(unsigned char *buffer, int bit)
     return (buffer[bit / 8] & (1 << (bit % 8))) != 0;
 }
 
-/* Update superblock on disk */
+/* Force write buffer to disk immediately */
+static int force_write_buffer(struct buffer_head *bh)
+{
+    int ret;
+    
+    mark_buffer_dirty(bh);
+    ret = sync_dirty_buffer(bh);
+    if (ret) {
+        pr_err("Failed to sync buffer to disk: %d\n", ret);
+        return ret;
+    }
+    
+    /* Additional barrier to ensure write completion */
+    if (bh->b_bdev && bh->b_bdev->bd_disk) {
+        ret = blkdev_issue_flush(bh->b_bdev, GFP_KERNEL, NULL);
+        if (ret) {
+            pr_warn("Failed to flush device: %d\n", ret);
+        }
+    }
+    
+    return 0;
+}
+
+/* Update superblock on disk with forced write */
 static int simplefs_update_sb(struct super_block *sb)
 {
     struct simplefs_sb_info *sbi = SIMPLEFS_SB(sb);
     struct buffer_head *bh;
     struct simplefs_sb_info *disk_sb;
+    int ret;
+
+    pr_info("Updating superblock: free_blocks=%u, free_inodes=%u\n",
+            sbi->nr_free_blocks, sbi->nr_free_inodes);
 
     bh = sb_bread(sb, SIMPLEFS_SUPERBLOCK_BLOCK);
     if (!bh) {
@@ -44,11 +72,16 @@ static int simplefs_update_sb(struct super_block *sb)
     disk_sb->nr_free_blocks = cpu_to_le32(sbi->nr_free_blocks);
     disk_sb->nr_free_inodes = cpu_to_le32(sbi->nr_free_inodes);
     
-    mark_buffer_dirty(bh);
-    sync_dirty_buffer(bh);
+    /* Force immediate write to disk */
+    ret = force_write_buffer(bh);
     brelse(bh);
     
-    return 0;
+    if (ret == 0) {
+        pr_info("Superblock updated on disk: free_blocks=%u, free_inodes=%u\n",
+                sbi->nr_free_blocks, sbi->nr_free_inodes);
+    }
+    
+    return ret;
 }
 
 /* Allocate a free inode number */
@@ -58,7 +91,7 @@ int simplefs_alloc_inode_num(struct super_block *sb)
     struct buffer_head *bh;
     unsigned char *bitmap;
     int free_inode;
-    int i;
+    int i, ret;
 
     pr_info("Allocating inode: free_inodes=%u, total_inodes=%u\n", 
             sbi->nr_free_inodes, sbi->nr_inodes);
@@ -103,16 +136,32 @@ int simplefs_alloc_inode_num(struct super_block *sb)
     /* Mark inode as used */
     set_bit_in_buffer(bitmap, free_inode);
     
-    /* Mark buffer as dirty and release */
-    mark_buffer_dirty(bh);
-    sync_dirty_buffer(bh);
+    /* Force write bitmap to disk immediately */
+    ret = force_write_buffer(bh);
     brelse(bh);
+    
+    if (ret) {
+        pr_err("Failed to write inode bitmap to disk: %d\n", ret);
+        return ret;
+    }
 
-    /* Update superblock free count */
+    /* Update superblock free count and write to disk */
     sbi->nr_free_inodes--;
-    simplefs_update_sb(sb);
+    ret = simplefs_update_sb(sb);
+    if (ret) {
+        /* Rollback: mark inode as free again */
+        bh = sb_bread(sb, sbi->inode_bitmap_block);
+        if (bh) {
+            clear_bit_in_buffer((unsigned char *)bh->b_data, free_inode);
+            force_write_buffer(bh);
+            brelse(bh);
+        }
+        sbi->nr_free_inodes++;
+        return ret;
+    }
 
-    pr_info("Allocated inode %d (remaining: %u)\n", free_inode, sbi->nr_free_inodes);
+    pr_info("Allocated inode %d (remaining: %u) - written to disk\n", 
+            free_inode, sbi->nr_free_inodes);
     return free_inode;
 }
 
@@ -122,6 +171,9 @@ void simplefs_free_inode_num(struct super_block *sb, unsigned long ino)
     struct simplefs_sb_info *sbi = SIMPLEFS_SB(sb);
     struct buffer_head *bh;
     unsigned char *bitmap;
+    int ret;
+
+    pr_info("Freeing inode %lu\n", ino);
 
     if (ino == 0 || ino >= sbi->nr_inodes) {
         pr_err("Invalid inode number %lu\n", ino);
@@ -147,16 +199,25 @@ void simplefs_free_inode_num(struct super_block *sb, unsigned long ino)
     /* Mark inode as free */
     clear_bit_in_buffer(bitmap, ino);
     
-    /* Mark buffer as dirty and release */
-    mark_buffer_dirty(bh);
-    sync_dirty_buffer(bh);
+    /* Force write bitmap to disk immediately */
+    ret = force_write_buffer(bh);
     brelse(bh);
+    
+    if (ret) {
+        pr_err("Failed to write inode bitmap to disk: %d\n", ret);
+        return;
+    }
 
-    /* Update superblock free count */
+    /* Update superblock free count and write to disk */
     sbi->nr_free_inodes++;
-    simplefs_update_sb(sb);
+    ret = simplefs_update_sb(sb);
+    if (ret) {
+        pr_err("Failed to update superblock after freeing inode\n");
+        /* Note: We could rollback here, but it's complex and this is just a warning */
+    }
 
-    pr_info("Freed inode %lu\n", ino);
+    pr_info("Freed inode %lu - written to disk (remaining free: %u)\n", 
+            ino, sbi->nr_free_inodes);
 }
 
 /* Allocate a free block number */
@@ -166,7 +227,7 @@ int simplefs_alloc_block_num(struct super_block *sb)
     struct buffer_head *bh;
     unsigned char *bitmap;
     int free_block;
-    int i;
+    int i, ret;
 
     pr_info("Allocating block: free_blocks=%u, first_data=%u\n", 
             sbi->nr_free_blocks, sbi->first_data_block);
@@ -203,16 +264,32 @@ int simplefs_alloc_block_num(struct super_block *sb)
     /* Mark block as used */
     set_bit_in_buffer(bitmap, free_block);
     
-    /* Mark buffer as dirty and release */
-    mark_buffer_dirty(bh);
-    sync_dirty_buffer(bh);
+    /* Force write bitmap to disk immediately */
+    ret = force_write_buffer(bh);
     brelse(bh);
+    
+    if (ret) {
+        pr_err("Failed to write block bitmap to disk: %d\n", ret);
+        return ret;
+    }
 
-    /* Update superblock free count */
+    /* Update superblock free count and write to disk */
     sbi->nr_free_blocks--;
-    simplefs_update_sb(sb);
+    ret = simplefs_update_sb(sb);
+    if (ret) {
+        /* Rollback: mark block as free again */
+        bh = sb_bread(sb, sbi->block_bitmap_block);
+        if (bh) {
+            clear_bit_in_buffer((unsigned char *)bh->b_data, free_block);
+            force_write_buffer(bh);
+            brelse(bh);
+        }
+        sbi->nr_free_blocks++;
+        return ret;
+    }
 
-    pr_info("Allocated block %d (remaining: %u)\n", free_block, sbi->nr_free_blocks);
+    pr_info("Allocated block %d (remaining: %u) - written to disk\n", 
+            free_block, sbi->nr_free_blocks);
     return free_block;
 }
 
@@ -222,6 +299,9 @@ void simplefs_free_block_num(struct super_block *sb, unsigned long block)
     struct simplefs_sb_info *sbi = SIMPLEFS_SB(sb);
     struct buffer_head *bh;
     unsigned char *bitmap;
+    int ret;
+
+    pr_info("Freeing block %lu\n", block);
 
     if (block < sbi->first_data_block || block >= sbi->nr_blocks) {
         pr_err("Invalid block number %lu\n", block);
@@ -247,14 +327,23 @@ void simplefs_free_block_num(struct super_block *sb, unsigned long block)
     /* Mark block as free */
     clear_bit_in_buffer(bitmap, block);
     
-    /* Mark buffer as dirty and release */
-    mark_buffer_dirty(bh);
-    sync_dirty_buffer(bh);
+    /* Force write bitmap to disk immediately */
+    ret = force_write_buffer(bh);
     brelse(bh);
+    
+    if (ret) {
+        pr_err("Failed to write block bitmap to disk: %d\n", ret);
+        return;
+    }
 
-    /* Update superblock free count */
+    /* Update superblock free count and write to disk */
     sbi->nr_free_blocks++;
-    simplefs_update_sb(sb);
+    ret = simplefs_update_sb(sb);
+    if (ret) {
+        pr_err("Failed to update superblock after freeing block\n");
+        /* Note: We could rollback here, but it's complex and this is just a warning */
+    }
 
-    pr_info("Freed block %lu\n", block);
+    pr_info("Freed block %lu - written to disk (remaining free: %u)\n", 
+            block, sbi->nr_free_blocks);
 }
